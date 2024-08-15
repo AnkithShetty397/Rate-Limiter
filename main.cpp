@@ -1,12 +1,63 @@
 #include<iostream>
+#include<vector>
+#include<queue>
 #include<unordered_map>
+#include<functional>
 #include<mutex>
+#include <condition_variable>
 #include<thread>
 #include<chrono>
-
-using namespace std;
+#include<boost/asio.hpp>
 
 #define MAX_REQS 10
+
+using namespace std;
+using namespace boost::asio;
+
+class ThreadPool{
+private:
+	vector<thread> threads;
+	queue<function<void()>> tasks;
+	mutex queue_mutex;
+	condition_variable cv;
+	bool stop=false;
+
+public:
+	ThreadPool(size_t num_threads=thread::hardware_concurrency()){
+		for(size_t i=0;i<num_threads;i++){
+			threads.emplace_back([this]{
+				while(true){
+				function<void()> task;
+				{
+					unique_lock<mutex> lock(queue_mutex);
+					cv.wait(lock,[this]{ return !tasks.empty()||stop;});
+					if(stop && tasks.empty()) return;
+					task = std::move(tasks.front());
+					tasks.pop();
+				}
+				task();
+			}
+			});
+		}
+	}
+	~ThreadPool(){
+		{
+			unique_lock<mutex> lock(queue_mutex);
+			stop=true;
+		}
+		cv.notify_all();
+		for(auto& thread:threads){
+			thread.join();
+		}
+	}
+	void enqueue(function<void()> tcp_connection){
+		{
+			unique_lock<mutex> lock(queue_mutex);
+			tasks.emplace(std::move(tcp_connection));
+		}
+		cv.notify_one();
+	}
+};
 
 unordered_map<string,pair<int,mutex>> req_map;		// [(ip_address,(count,mutex))]
 
@@ -18,69 +69,64 @@ bool process_req(string& ip_addr){
 		when the guard object goes out of scope, the guard destructor automatically unlocks the mutex 
 	*/
 	count++;
-	if(count>MAX_REQ)
-		return false;	
-	return true;	
+	if(count>MAX_REQS)
+		return false;
+	return true;
 }
 
 void decrement_count(){
 	while(true){
-		this_thread::sleep_for(chrono::milliseconds(100));
+		this_thread::sleep_for(std::chrono::milliseconds(100));
 		for(auto mp =req_map.begin();mp!=req_map.end();){
 			auto& [ip_addr, data] = *mp;
 			auto& [count, mutex1] = data;
-			
+
 			lock_guard<mutex> guard(mutex1);
-			
+
 			if(0<count)
-				count--;					
+				count--;
 			if(count==0)
 				mp = req_map.erase(mp);		//this will return the next element in the map
 			else
-				mp++;					
+				mp++;
 		}
 	}
 }
 
-void middleware(){
-	/*
-    This function should:
-    1. Listen to a specific port for incoming requests.
-    2. Extract the IP address from the incoming request.
-    3. Use the `process_req` function to decide whether to process the request.
-    4. If accepted, forward the request to the appropriate service and return the response.
-    */
+void tcp_connection_handler(ip::tcp::socket socket){
+	try{
+		string client_ip = socket.remote_endpoint().address().to_string();
+		if(!process_req(client_ip)){
+			//Send back 429 Too Many Requests status code response
+			return;
+		}
 
-    while (true) {
-        // Listen to the port here (simplified pseudo-code below)
-        string ip_addr;  // Assume we extract the IP address from the incoming request
-        // Example: ip_addr = get_ip_from_request();
-        
-        if (process_req(ip_addr)) {
-            // Forward the request to the target service and get the response
-            // Example: string response = forward_request_to_service();
-            
-            // Send the response back to the original requester
-            // Example: send_response_to_client(response);
-        } else {
-            // Respond with an error or rate limit message
-            // Example: send_response_to_client("429 Too Many Requests");
-        }
+		// Handle the request
 
-        // Repeat this process in a loop
-    }
+		return;
+	}catch(std::exception& e){
+		cerr<<"Error: "<<e.what()<<endl;
+	}
 }
 
 int main(){
+	io_service io_service;
+	ip::tcp::acceptor acceptor(io_service, ip::tcp::endpoint(ip::tcp::v4(), 8080));
 	thread decrement_thread(decrement_count);
-	thread middleware_thread(middleware); 
-	
-	middleware_thread.join();
+
+	ThreadPool thread_pool(16);
+
+	while(true){
+		ip::tcp::socket socket(io_service);
+		acceptor.accept(socket);
+		
+		thread_pool.enqueue([sock=std::move(socket)]() mutable{ tcp_connection_handler(std::move(sock));});
+	}
+
 	decrement_thread.join();
-	
 	return 0;
 }
-	
+
 
 
 
