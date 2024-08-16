@@ -2,9 +2,8 @@
 #include<vector>
 #include<queue>
 #include<unordered_map>
-#include<functional>
 #include<mutex>
-#include <condition_variable>
+#include<condition_variable>
 #include<thread>
 #include<chrono>
 #include<boost/asio.hpp>
@@ -17,7 +16,7 @@ using namespace boost::asio;
 class ThreadPool{
 private:
 	vector<thread> threads;
-	queue<function<void()>> tasks;
+	queue<std::packaged_task<void()>> tasks;
 	mutex queue_mutex;
 	condition_variable cv;
 	bool stop=false;
@@ -25,9 +24,10 @@ private:
 public:
 	ThreadPool(size_t num_threads=thread::hardware_concurrency()){
 		for(size_t i=0;i<num_threads;i++){
+			cout<<"Thread "<<i+1<<" created"<<endl;
 			threads.emplace_back([this]{
 				while(true){
-				function<void()> task;
+				std::packaged_task<void()> task;
 				{
 					unique_lock<mutex> lock(queue_mutex);
 					cv.wait(lock,[this]{ return !tasks.empty()||stop;});
@@ -50,13 +50,14 @@ public:
 			thread.join();
 		}
 	}
-	void enqueue(function<void()> tcp_connection){
-		{
-			unique_lock<mutex> lock(queue_mutex);
-			tasks.emplace(std::move(tcp_connection));
-		}
-		cv.notify_one();
-	}
+    template<typename F>
+    void enqueue(F&& tcp_connection) {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            tasks.emplace(std::forward<F>(tcp_connection));
+        }
+        cv.notify_one();
+    }
 };
 
 unordered_map<string,pair<int,mutex>> req_map;		// [(ip_address,(count,mutex))]
@@ -93,44 +94,71 @@ void decrement_count(){
 	}
 }
 
-void tcp_connection_handler(ip::tcp::socket socket){
-	try{
-		string client_ip = socket.remote_endpoint().address().to_string();
-		if(!process_req(client_ip)){
-			//Send back 429 Too Many Requests status code response
-			return;
-		}
+void tcp_connection_handler(ip::tcp::socket client_socket){
+    try{
+        string client_ip = client_socket.remote_endpoint().address().to_string();
+        if(!process_req(client_ip)){
+			cout<<"Blocked "<<client_ip<<endl;
+            client_socket.send(buffer("HTTP/1.1 429 Too Many Requests\r\n\r\n"));
+            return;
+        }
 
-		// Handle the request
+    	auto start = std::chrono::steady_clock::now();
+		
+        // Buffer to hold the incoming request
+        boost::asio::streambuf request_buffer;
+        boost::asio::read_until(client_socket, request_buffer, "\r\n\r\n"); // Read the HTTP request headers
 
-		return;
-	}catch(std::exception& e){
-		cerr<<"Error: "<<e.what()<<endl;
-	}
+        // Convert request buffer to string
+        std::istream request_stream(&request_buffer);
+        std::string request((std::istreambuf_iterator<char>(request_stream)), std::istreambuf_iterator<char>());
+
+        // Connect to the internal server
+        ip::tcp::socket internal_socket(client_socket.get_executor());
+        ip::tcp::resolver resolver(client_socket.get_executor());
+        ip::tcp::resolver::query query("127.0.0.1", "3000"); 
+        ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+
+        boost::asio::connect(internal_socket, endpoint_iterator);
+
+        // Forward the request to the internal server
+        boost::asio::write(internal_socket, boost::asio::buffer(request));
+
+        // Buffer to hold the internal server's response
+        boost::asio::streambuf response_buffer;
+        boost::asio::read_until(internal_socket, response_buffer, "\r\n\r\n"); // Read the response headers
+
+        // Relay the response back to the client
+        boost::asio::write(client_socket, response_buffer);
+
+		auto end = std::chrono::steady_clock::now();
+		std::chrono::duration<double> total_duration = end - start;
+		std::cout << "Total time for request handling: " << total_duration.count()<< " seconds" << std::endl;
+        return;
+    }  catch (const boost::system::system_error& e) {
+        cerr << "Boost Error: " << e.what() << endl;
+        client_socket.send(buffer("HTTP/1.1 500 Internal Server Error\r\n\r\n"));
+    } catch (const std::exception& e) {
+        cerr << "Standard Error: " << e.what() << endl;
+        client_socket.send(buffer("HTTP/1.1 500 Internal Server Error\r\n\r\n"));
+    }
 }
+
 
 int main(){
 	io_service io_service;
 	ip::tcp::acceptor acceptor(io_service, ip::tcp::endpoint(ip::tcp::v4(), 8080));
 	thread decrement_thread(decrement_count);
-
 	ThreadPool thread_pool(16);
-
 	while(true){
 		ip::tcp::socket socket(io_service);
 		acceptor.accept(socket);
-		
-		thread_pool.enqueue([sock=std::move(socket)]() mutable{ tcp_connection_handler(std::move(sock));});
+		thread_pool.enqueue([sock = std::move(socket)]() mutable { 
+			tcp_connection_handler(std::move(sock)); 
+		});
 	}
-
+	
 	decrement_thread.join();
 	return 0;
 }
-
-
-
-
-
-
-
 
