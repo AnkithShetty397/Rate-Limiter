@@ -6,12 +6,72 @@
 #include<condition_variable>
 #include<thread>
 #include<chrono>
+#include<cmath>
 #include<boost/asio.hpp>
 
 #define MAX_REQS 10
 
 using namespace std;
 using namespace boost::asio;
+
+class RateLimiterEMA{
+private:
+	unordered_map<string,double> ema_map;
+	unordered_map<string,std::chrono::steady_clock::time_point> last_update_map;
+	double alpha;		//smoothing factor	(0-1)
+	double threshold;	//rate limiter threashold (req/sec)
+	mutex mtx;
+
+public:
+	RateLimiterEMA(double alpha,double threshold){
+		this->alpha=alpha;
+		this->threshold=threshold;
+	}
+	
+	RateLimiterEMA(){
+		alpha=0.5;
+		threshold=10;
+	}
+	
+	bool process_req(string& ip_addr){
+		auto now = std::chrono::steady_clock::now();
+
+		lock_guard<mutex> lock(mtx);
+
+		auto& last_update = last_update_map[ip_addr];
+
+		std::chrono::duration<double> time_diff = now - last_update;
+		last_update = now;
+
+		double request_rate = 1.0 / time_diff.count();  // Calculate the instantaneous request rate
+
+		// Cap the maximum rate to avoid spikes due to very small time_diff
+		request_rate = std::min(request_rate, threshold * 2);
+
+		if(ema_map.find(ip_addr) == ema_map.end()){
+			ema_map[ip_addr] = request_rate;  // Initialize EMA with the calculated rate
+			return true;
+		}
+
+		double& current_ema = ema_map[ip_addr];
+		current_ema = alpha * request_rate + (1 - alpha) * current_ema;
+
+		std::cout << "IP: " << ip_addr 
+				<< " | Time Diff: " << time_diff.count() 
+				<< " | Request Rate: " << request_rate 
+				<< " | Current EMA: " << current_ema 
+				<< " | Threshold: " << threshold 
+				<< std::endl;
+
+		if(current_ema > threshold){
+			std::cout << "Blocked " << ip_addr << std::endl;
+			return false;
+		} else {
+			std::cout << "Allowed " << ip_addr << std::endl;
+			return true;
+		}
+	}
+};
 
 class ThreadPool{
 private:
@@ -60,44 +120,10 @@ public:
     }
 };
 
-unordered_map<string,pair<int,mutex>> req_map;		// [(ip_address,(count,mutex))]
-
-bool process_req(string& ip_addr){
-	auto& [count,mutex1] = req_map[ip_addr];
-	lock_guard<mutex> guard(mutex1);	// Resource Aquisition  Is Initialized (RAII) here
-	/*
-		the thread will wait until it gets access to the resource	-aquiring lock
-		when the guard object goes out of scope, the guard destructor automatically unlocks the mutex 
-	*/
-	count++;
-	if(count>MAX_REQS)
-		return false;
-	return true;
-}
-
-void decrement_count(){
-	while(true){
-		this_thread::sleep_for(std::chrono::milliseconds(100));
-		for(auto mp =req_map.begin();mp!=req_map.end();){
-			auto& [ip_addr, data] = *mp;
-			auto& [count, mutex1] = data;
-
-			lock_guard<mutex> guard(mutex1);
-
-			if(0<count)
-				count--;
-			if(count==0)
-				mp = req_map.erase(mp);		//this will return the next element in the map
-			else
-				mp++;
-		}
-	}
-}
-
-void tcp_connection_handler(ip::tcp::socket client_socket){
+void tcp_connection_handler(ip::tcp::socket client_socket,RateLimiterEMA* rate_limiter){
     try{
         string client_ip = client_socket.remote_endpoint().address().to_string();
-        if(!process_req(client_ip)){
+        if(!rate_limiter->process_req(client_ip)){
 			cout<<"Blocked "<<client_ip<<endl;
             client_socket.send(buffer("HTTP/1.1 429 Too Many Requests\r\n\r\n"));
             return;
@@ -146,19 +172,19 @@ void tcp_connection_handler(ip::tcp::socket client_socket){
 
 
 int main(){
+	auto rate_limiter=make_unique<RateLimiterEMA>(0.5,5);
+
 	io_service io_service;
 	ip::tcp::acceptor acceptor(io_service, ip::tcp::endpoint(ip::tcp::v4(), 8080));
-	thread decrement_thread(decrement_count);
 	ThreadPool thread_pool(16);
 	while(true){
 		ip::tcp::socket socket(io_service);
 		acceptor.accept(socket);
-		thread_pool.enqueue([sock = std::move(socket)]() mutable { 
-			tcp_connection_handler(std::move(sock)); 
+		thread_pool.enqueue([sock = std::move(socket),rate_limiter=rate_limiter.get()]() mutable { 
+			tcp_connection_handler(std::move(sock),rate_limiter); 
 		});
 	}
 	
-	decrement_thread.join();
 	return 0;
 }
 
